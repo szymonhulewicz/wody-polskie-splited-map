@@ -10,44 +10,165 @@ from shapely.geometry import box
 
 warnings.filterwarnings("ignore")
 
-# =========================
-# KONFIGURACJA
-# =========================
-
 typy = ["Rzeki", "Morze"]
 dorzecza = ["Odra", "Dunaj", "Łaba", "Niemen", "Pregola", "Wisła"]
 scenariusze = ["1", "02", "10"]
 
 base_path = Path("/home/ailab-user/wody_polskie/Wody_Polskie")
 out_base = Path("/home/ailab-user/splited-map")
-
-target_parts = 1000
-overlap_ratio = 0.10
-
 out_base.mkdir(parents=True, exist_ok=True)
 
+max_parts_for_wisla = 1000
+overlap_ratio = 0.10
+
+
+def get_input_path(typ, rzeka, scen):
+    suffix = "_M" if typ == "Morze" else ""
+    return (
+        base_path
+        / typ
+        / "Dorzecza"
+        / rzeka
+        / "MZP"
+        / f"glebokosc_{scen}{suffix}.shp"
+    )
+
+
+def read_bounds_area(input_shp):
+    gdf = gpd.read_file(input_shp)
+
+    if gdf.empty or gdf.crs is None:
+        return None
+
+    gdf = gdf.to_crs(4326)
+    lon_min, lat_min, lon_max, lat_max = gdf.total_bounds
+
+    area = (lon_max - lon_min) * (lat_max - lat_min)
+
+    return {
+        "lon_min": lon_min,
+        "lat_min": lat_min,
+        "lon_max": lon_max,
+        "lat_max": lat_max,
+        "area": area
+    }
+
+
 # =========================
-# FUNKCJA DZIELĄCA PLIK SHP
+# 1. ZBIERAMY PLIKI I ICH ROZMIARY
 # =========================
 
-def split_shp_to_tiles(input_shp, typ, rzeka, scen):
+files_info = []
+
+for typ in typy:
+    for rzeka in dorzecza:
+        for scen in scenariusze:
+            input_shp = get_input_path(typ, rzeka, scen)
+
+            if not input_shp.exists():
+                print(f"Nie istnieje: {input_shp}")
+                continue
+
+            bounds = read_bounds_area(input_shp)
+
+            if bounds is None:
+                print(f"Nie udało się odczytać bbox: {input_shp}")
+                continue
+
+            files_info.append({
+                "typ": typ,
+                "rzeka": rzeka,
+                "scen": scen,
+                "path": input_shp,
+                **bounds
+            })
+
+
+# =========================
+# 2. SZUKAMY NAJWIĘKSZEJ WISŁY
+# =========================
+
+wisla_files = [f for f in files_info if f["rzeka"] == "Wisła"]
+
+if not wisla_files:
+    raise ValueError("Nie znaleziono żadnego pliku dla Wisły")
+
+wisla_max_area = max(f["area"] for f in wisla_files)
+
+print(f"Największa powierzchnia Wisły: {wisla_max_area}")
+
+
+# =========================
+# 3. LICZBA KAFELKÓW PROPORCJONALNIE DO WISŁY
+# =========================
+
+for f in files_info:
+    ratio = f["area"] / wisla_max_area
+
+    target_parts = round(max_parts_for_wisla * ratio)
+
+    # minimum 1 plik
+    target_parts = max(1, target_parts)
+
+    # maksimum 1000
+    target_parts = min(max_parts_for_wisla, target_parts)
+
+    f["target_parts"] = target_parts
+
+    print(
+        f'{f["typ"]} {f["rzeka"]} glebokosc_{f["scen"]}: '
+        f'{target_parts} części'
+    )
+
+
+# =========================
+# 4. FUNKCJA ZAPISUJĄCA CAŁY PLIK
+# =========================
+
+def save_whole_file_with_coords(input_shp, typ, rzeka, scen):
+    gdf = gpd.read_file(input_shp).to_crs(4326)
+    gdf = gdf[gdf.geometry.notna()].copy()
+
+    if gdf.empty:
+        return
+
+    gdf["geometry"] = gdf.geometry.make_valid()
+
+    lon_min, lat_min, lon_max, lat_max = gdf.total_bounds
+
+    filename = (
+        f"{typ}_{rzeka}_glebokosc_{scen}_"
+        f"lon_{lon_min:.6f}_{lon_max:.6f}_"
+        f"lat_{lat_min:.6f}_{lat_max:.6f}.shp"
+    )
+
+    output_shp = out_base / filename
+    gdf.to_file(output_shp, driver="ESRI Shapefile", encoding="utf-8")
+
+    print(f"Zapisano cały plik: {filename}")
+
+
+# =========================
+# 5. FUNKCJA DZIELĄCA NA KAFELKI
+# =========================
+
+def split_shp_to_tiles(input_shp, typ, rzeka, scen, target_parts):
     start = time.time()
 
     print(f"\nPrzetwarzam: {input_shp}")
+    print(f"Liczba kafelków: {target_parts}")
+
+    if target_parts <= 1:
+        save_whole_file_with_coords(input_shp, typ, rzeka, scen)
+        return
 
     gdf = gpd.read_file(input_shp)
 
-    if gdf.empty:
-        print("Pusty plik — pomijam")
+    if gdf.empty or gdf.crs is None:
+        print("Pusty plik albo brak CRS — pomijam")
         return
 
-    if gdf.crs is None:
-        print("Brak CRS — pomijam")
-        return
-
-    # Nazwy plików mają mieć longitude/latitude w systemie dziesiętnym
     gdf = gdf.to_crs(4326)
-
     gdf = gdf[gdf.geometry.notna()].copy()
 
     if gdf.empty:
@@ -76,8 +197,6 @@ def split_shp_to_tiles(input_shp, typ, rzeka, scen):
             lon_width = lon1 - lon0
             lat_height = lat1 - lat0
 
-            # Realny zakres ma 10% nakładki,
-            # ale nazwa pliku zostaje po zakresie nominalnym
             real_lon0 = lon0 - lon_width * overlap_ratio
             real_lon1 = lon1 + lon_width * overlap_ratio
             real_lat0 = lat0 - lat_height * overlap_ratio
@@ -103,42 +222,26 @@ def split_shp_to_tiles(input_shp, typ, rzeka, scen):
             )
 
             output_shp = out_base / filename
-
             part.to_file(output_shp, driver="ESRI Shapefile", encoding="utf-8")
+
             counter += 1
 
     elapsed = round(time.time() - start, 2)
-    print(f"Zapisano {counter} kafelków dla {input_shp.name} w {elapsed}s")
+    print(f"Zapisano {counter} kafelków w {elapsed}s")
 
 
 # =========================
-# GŁÓWNA PĘTLA
+# 6. GŁÓWNE WYKONANIE
 # =========================
 
-for typ in typy:
-    for rzeka in dorzecza:
-
-        if typ == "Morze":
-            suffix = "_M"
-        else:
-            suffix = ""
-
-        for scen in scenariusze:
-
-            input_shp = (
-                base_path
-                / typ
-                / "Dorzecza"
-                / rzeka
-                / "MZP"
-                / f"glebokosc_{scen}{suffix}.shp"
-            )
-
-            if not input_shp.exists():
-                print(f"Nie istnieje: {input_shp}")
-                continue
-
-            split_shp_to_tiles(input_shp, typ, rzeka, scen)
+for f in files_info:
+    split_shp_to_tiles(
+        input_shp=f["path"],
+        typ=f["typ"],
+        rzeka=f["rzeka"],
+        scen=f["scen"],
+        target_parts=f["target_parts"]
+    )
 
 print("\nGotowe.")
 print(f"Wyniki zapisane w: {out_base}")
